@@ -101,32 +101,53 @@ function firstImage(html) {
 // ---------------------------------------------------------------------------
 // DEVFORUM  (Discourse, no key)
 // ---------------------------------------------------------------------------
-let categoryIdCache = null;
+// cache the PROMISE, not the result: all devforum sources are fetched in
+// parallel, so caching only the resolved value made every one of them fetch
+// categories.json before the first had finished.
+let categoryIdPromise = null;
 
-async function loadCategoryIds() {
-  if (categoryIdCache) return categoryIdCache;
-  const data = await getJSON(
-    "https://devforum.roblox.com/categories.json?include_subcategories=true"
-  );
-  const map = {};
-  const walk = (list) => {
-    for (const c of list || []) {
-      map[c.slug] = c.id;
-      if (c.subcategory_list) walk(c.subcategory_list);
-    }
-  };
-  walk(data?.category_list?.categories);
-  categoryIdCache = map;
-  console.log(`devforum: resolved ${Object.keys(map).length} category slugs`);
-  return map;
+function loadCategoryIds() {
+  if (categoryIdPromise) return categoryIdPromise;
+  categoryIdPromise = (async () => {
+    const data = await getJSON(
+      "https://devforum.roblox.com/categories.json?include_subcategories=true"
+    );
+    const map = {};
+    const walk = (list) => {
+      for (const c of list || []) {
+        map[c.slug] = c.id;
+        if (c.subcategory_list) walk(c.subcategory_list);
+        if (c.subcategory_ids && Array.isArray(c.subcategory_list)) walk(c.subcategory_list);
+      }
+    };
+    walk(data?.category_list?.categories);
+    console.log(`devforum: resolved ${Object.keys(map).length} category slugs`);
+    return map;
+  })().catch((e) => {
+    categoryIdPromise = null; // allow a retry on the next refresh
+    throw e;
+  });
+  return categoryIdPromise;
 }
 
 async function fetchDevforum(cfg) {
   const ids = await loadCategoryIds();
   const id = ids[cfg.slug];
-  if (!id) throw new Error(`unknown category slug "${cfg.slug}"`);
 
-  const data = await getJSON(`https://devforum.roblox.com/c/${cfg.slug}/${id}.json`);
+  let data;
+  if (id) {
+    data = await getJSON(`https://devforum.roblox.com/c/${cfg.slug}/${id}.json`);
+  } else {
+    // some categories are nested and do not appear in the flat list; the
+    // id-less form still resolves them on Discourse
+    try {
+      data = await getJSON(`https://devforum.roblox.com/c/${cfg.slug}.json`);
+    } catch {
+      console.warn(`devforum: slug "${cfg.slug}" not found; skipping. See /categories for valid slugs.`);
+      return [];
+    }
+  }
+
   const topics = data?.topic_list?.topics || [];
   return topics
     .filter((t) => !t.pinned_globally)
@@ -285,12 +306,33 @@ function validate(a) {
 }
 
 async function refresh() {
-  const jobs = [
-    ...DEVFORUM_CATEGORIES.map((c) => ({ id: `devforum:${c.slug}`, run: () => fetchDevforum(c) })),
-    ...SUBREDDITS.map((c) => ({ id: `reddit:${c.name}`, run: () => fetchSubreddit(c) })),
-  ];
+  const devforumJobs = DEVFORUM_CATEGORIES.map((c) => ({
+    id: `devforum:${c.slug}`,
+    run: () => fetchDevforum(c),
+  }));
 
-  const results = await Promise.allSettled(jobs.map((j) => j.run()));
+  // reddit rate-limits hard (429) when several requests land together, so these
+  // run one at a time with a gap rather than in parallel
+  const redditJobs = SUBREDDITS.map((c) => ({
+    id: `reddit:${c.name}`,
+    run: () => fetchSubreddit(c),
+  }));
+
+  const jobs = [...devforumJobs, ...redditJobs];
+
+  const devforumResults = await Promise.allSettled(devforumJobs.map((j) => j.run()));
+
+  const redditResults = [];
+  for (const job of redditJobs) {
+    try {
+      redditResults.push({ status: "fulfilled", value: await job.run() });
+    } catch (e) {
+      redditResults.push({ status: "rejected", reason: e });
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  const results = [...devforumResults, ...redditResults];
 
   const all = [];
   let okCount = 0;
