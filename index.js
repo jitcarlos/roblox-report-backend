@@ -30,6 +30,9 @@ const DEVFORUM_CATEGORIES = [
   // pages: how many pages of ~30 topics to pull. the update categories carry the
   // actual feature news (age verification, dynamic heads, quick words), so they
   // get the most depth.
+  // the parent "Updates" category: product announcements, news and staff posts.
+  // this is the canonical feed for things like age verification and avatar changes.
+  { slug: "updates",             source: "Roblox", category: "Platform",  confirmed: true, pages: 4 },
   { slug: "announcements",       source: "Roblox", category: "Platform",  confirmed: true, pages: 4 },
   { slug: "release-notes",       source: "Roblox", category: "Studio",    confirmed: true, pages: 4 },
   { slug: "community-resources", source: "Roblox", category: "Community", confirmed: true },
@@ -159,7 +162,9 @@ async function fetchDevforum(cfg) {
   for (let p = 0; p < pages; p++) {
     let page;
     try {
-      page = await getJSON(`https://devforum.roblox.com/c/${path}.json?page=${p}`);
+      page = await getJSON(
+        `https://devforum.roblox.com/c/${path}.json?page=${p}&include_subcategories=true`
+      );
     } catch (e) {
       if (p === 0) throw e; // first page failing is a real error
       break;                // later pages just mean we ran out
@@ -464,6 +469,63 @@ async function refresh() {
   );
 }
 
+
+// ---------------------------------------------------------------------------
+// SEARCH
+// The cache can only ever hold a few hundred recent topics, so searching it for
+// something older ("age verification", "dynamic heads") finds nothing. Discourse
+// exposes a real search endpoint, so a live query hits the whole DevForum
+// history instead. Restricted to #updates so results stay official.
+// ---------------------------------------------------------------------------
+const searchCache = new Map(); // query -> { at, articles }
+const SEARCH_TTL_MS = 5 * 60 * 1000;
+
+async function searchDevforum(query) {
+  const q = String(query).trim().slice(0, 80);
+  if (!q) return [];
+
+  const hit = searchCache.get(q.toLowerCase());
+  if (hit && Date.now() - hit.at < SEARCH_TTL_MS) return hit.articles;
+
+  // "#updates" scopes the search to the official Updates category and its
+  // subcategories, which keeps game guides and chatter out of the results
+  const url =
+    "https://devforum.roblox.com/search.json?q=" +
+    encodeURIComponent(`${q} #updates`);
+
+  const data = await getJSON(url);
+  const topics = data?.topics || [];
+  const posts = data?.posts || [];
+
+  // search.json returns topics and posts separately; posts carry the blurb
+  const blurbByTopic = {};
+  for (const p of posts) {
+    if (p.topic_id && !blurbByTopic[p.topic_id]) blurbByTopic[p.topic_id] = stripHtml(p.blurb);
+  }
+
+  const out = [];
+  for (const t of topics) {
+    if (topicBlocked(t.title)) continue;
+    out.push(
+      withImage({
+        title: String(t.title).slice(0, 200),
+        description: (blurbByTopic[t.id] || t.title).slice(0, 500),
+        url: `https://devforum.roblox.com/t/${t.slug}/${t.id}`,
+        image: "",
+        source: "Roblox",
+        category: classify(t.title, "Platform"),
+        date: new Date(t.created_at).toISOString(),
+        confirmed: true,
+      })
+    );
+  }
+
+  out.sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
+  searchCache.set(q.toLowerCase(), { at: Date.now(), articles: out });
+  console.log(`search "${q}": ${out.length} results`);
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // SERVER
 // ---------------------------------------------------------------------------
@@ -471,6 +533,20 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith("/articles")) {
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "public, max-age=60" });
     res.end(JSON.stringify(cache));
+    return;
+  }
+  if (req.url.startsWith("/search")) {
+    const q = new URL(req.url, "http://x").searchParams.get("q") || "";
+    searchDevforum(q)
+      .then((articles) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ articles, query: q }));
+      })
+      .catch((e) => {
+        console.warn(`search failed: ${e.message}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ articles: [], query: q, error: e.message }));
+      });
     return;
   }
   if (req.url === "/health") {
