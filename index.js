@@ -479,51 +479,119 @@ async function refresh() {
 // ---------------------------------------------------------------------------
 const searchCache = new Map(); // query -> { at, articles }
 const SEARCH_TTL_MS = 5 * 60 * 1000;
+const SEARCH_PAGES = 8;          // discourse returns ~50 topics per page
+const SEARCH_MAX_RESULTS = 400;  // plenty; the ui renders the top slice
+
+function relevanceScore(title, description, query) {
+  // everything lowercased, so matching is case-insensitive throughout
+  const t = String(title).toLowerCase();
+  const d = String(description).toLowerCase();
+  const q = String(query).toLowerCase().trim();
+  const words = q.split(/\s+/).filter(Boolean);
+
+  let score = 0;
+
+  // an exact phrase in the title beats everything else, so searching a specific
+  // topic surfaces that topic ahead of general coverage
+  if (t === q) score += 100000;
+  else if (t.startsWith(q)) score += 50000;
+  else if (t.includes(q)) score += 25000;
+
+  // every query word present in the title
+  const inTitle = words.filter((w) => t.includes(w)).length;
+  if (inTitle === words.length && words.length > 0) score += 8000;
+  score += inTitle * 600;
+
+  // description matches count for much less
+  if (d.includes(q)) score += 1200;
+  score += words.filter((w) => d.includes(w)).length * 60;
+
+  // shorter titles that still match are usually the canonical announcement
+  if (t.includes(q)) score += Math.max(0, 200 - t.length);
+
+  return score;
+}
+
+async function searchDevforumPage(q, page, scoped) {
+  const term = scoped ? `${q} #updates` : q;
+  const url =
+    "https://devforum.roblox.com/search.json?q=" +
+    encodeURIComponent(term) +
+    `&page=${page}`;
+  return getJSON(url);
+}
 
 async function searchDevforum(query) {
   const q = String(query).trim().slice(0, 80);
   if (!q) return [];
 
-  const hit = searchCache.get(q.toLowerCase());
+  const key = q.toLowerCase();
+  const hit = searchCache.get(key);
   if (hit && Date.now() - hit.at < SEARCH_TTL_MS) return hit.articles;
 
-  // "#updates" scopes the search to the official Updates category and its
-  // subcategories, which keeps game guides and chatter out of the results
-  const url =
-    "https://devforum.roblox.com/search.json?q=" +
-    encodeURIComponent(`${q} #updates`);
+  const byUrl = new Map();
 
-  const data = await getJSON(url);
-  const topics = data?.topics || [];
-  const posts = data?.posts || [];
+  // two passes. official Updates first, then the wider forum, so official
+  // announcements always outrank general forum threads on the same topic.
+  const passes = [
+    { scoped: true,  pages: SEARCH_PAGES, bonus: 15000 },
+    { scoped: false, pages: SEARCH_PAGES, bonus: 0 },
+  ];
 
-  // search.json returns topics and posts separately; posts carry the blurb
-  const blurbByTopic = {};
-  for (const p of posts) {
-    if (p.topic_id && !blurbByTopic[p.topic_id]) blurbByTopic[p.topic_id] = stripHtml(p.blurb);
+  for (const pass of passes) {
+    for (let page = 1; page <= pass.pages; page++) {
+      let data;
+      try {
+        data = await searchDevforumPage(q, page, pass.scoped);
+      } catch (e) {
+        break; // ran out of pages, or discourse refused; keep what we have
+      }
+
+      const topics = data?.topics || [];
+      const posts = data?.posts || [];
+      if (topics.length === 0) break;
+
+      const blurb = {};
+      for (const p of posts) {
+        if (p.topic_id && !blurb[p.topic_id]) blurb[p.topic_id] = stripHtml(p.blurb);
+      }
+
+      for (const t of topics) {
+        if (topicBlocked(t.title)) continue;
+        if (!pass.scoped && gameCoverage(t.title)) continue;
+
+        const url = `https://devforum.roblox.com/t/${t.slug}/${t.id}`;
+        if (byUrl.has(url)) continue;
+
+        const description = (blurb[t.id] || t.title).slice(0, 500);
+        byUrl.set(url, {
+          article: withImage({
+            title: String(t.title).slice(0, 200),
+            description,
+            url,
+            image: "",
+            source: "Roblox",
+            category: classify(t.title, "Platform"),
+            date: new Date(t.created_at).toISOString(),
+            confirmed: true,
+          }),
+          score: relevanceScore(t.title, description, q) + pass.bonus,
+        });
+      }
+    }
   }
 
-  const out = [];
-  for (const t of topics) {
-    if (topicBlocked(t.title)) continue;
-    out.push(
-      withImage({
-        title: String(t.title).slice(0, 200),
-        description: (blurbByTopic[t.id] || t.title).slice(0, 500),
-        url: `https://devforum.roblox.com/t/${t.slug}/${t.id}`,
-        image: "",
-        source: "Roblox",
-        category: classify(t.title, "Platform"),
-        date: new Date(t.created_at).toISOString(),
-        confirmed: true,
-      })
-    );
-  }
+  const ranked = [...byUrl.values()]
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return Date.parse(b.article.date) - Date.parse(a.article.date);
+    })
+    .map((e) => e.article)
+    .slice(0, SEARCH_MAX_RESULTS);
 
-  out.sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
-  searchCache.set(q.toLowerCase(), { at: Date.now(), articles: out });
-  console.log(`search "${q}": ${out.length} results`);
-  return out;
+  searchCache.set(key, { at: Date.now(), articles: ranked });
+  console.log(`search "${q}": ${ranked.length} results (from ${byUrl.size} unique topics)`);
+  return ranked;
 }
 
 // ---------------------------------------------------------------------------
