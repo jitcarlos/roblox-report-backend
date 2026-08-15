@@ -13,7 +13,7 @@ import http from "node:http";
 
 const PORT = process.env.PORT || 3000;
 const REFRESH_MS = 10 * 60 * 1000;
-const MAX_ARTICLES = 80;
+const MAX_ARTICLES = 300;
 
 const UA = "web:roblox-report:v2.0 (news terminal for a Roblox experience)";
 
@@ -27,8 +27,11 @@ const UA = "web:roblox-report:v2.0 (news terminal for a Roblox experience)";
 // Visit /categories on your deployed service to see every slug available.
 // ---------------------------------------------------------------------------
 const DEVFORUM_CATEGORIES = [
-  { slug: "announcements",       source: "Roblox", category: "Platform",  confirmed: true },
-  { slug: "release-notes",       source: "Roblox", category: "Studio",    confirmed: true },
+  // pages: how many pages of ~30 topics to pull. the update categories carry the
+  // actual feature news (age verification, dynamic heads, quick words), so they
+  // get the most depth.
+  { slug: "announcements",       source: "Roblox", category: "Platform",  confirmed: true, pages: 4 },
+  { slug: "release-notes",       source: "Roblox", category: "Studio",    confirmed: true, pages: 4 },
   { slug: "community-resources", source: "Roblox", category: "Community", confirmed: true },
   { slug: "cool-creations",      source: "Roblox", category: "Community", confirmed: true },
   { slug: "bulletin-board",      source: "Roblox", category: "Community", confirmed: true },
@@ -147,21 +150,12 @@ async function fetchDevforum(cfg) {
   const ids = await loadCategoryIds();
   const id = ids[cfg.slug];
 
-  let data;
-  if (id) {
-    data = await getJSON(`https://devforum.roblox.com/c/${cfg.slug}/${id}.json`);
-  } else {
-    // some categories are nested and do not appear in the flat list; the
-    // id-less form still resolves them on Discourse
-    try {
-      data = await getJSON(`https://devforum.roblox.com/c/${cfg.slug}.json`);
-    } catch {
-      console.warn(`devforum: slug "${cfg.slug}" not found; skipping. See /categories for valid slugs.`);
-      return [];
-    }
+  const topics = data?.topic_list?.topics || [];
+  if (topics.length === 0) {
+    console.warn(`devforum: slug "${cfg.slug}" returned nothing; skipping.`);
+    return [];
   }
 
-  const topics = data?.topic_list?.topics || [];
   return topics
     .filter((t) => !t.pinned_globally && !topicBlocked(t.title))
     .map((t) => ({
@@ -205,12 +199,37 @@ const BLOCKED_WORDS = [
   "stock", "shares", "nyse", "earnings", "price target", "analyst",
   "investor", "market cap", "valuation", "quarterly results", "revenue beat",
   "downgrade", "upgrade rating", "short interest", "hedge fund",
-  // crime and safety reporting, not appropriate for an in-experience terminal
+  // crime and safety reporting, never appropriate on an in-experience terminal
   "arrest", "arrested", "charged", "predator", "grooming", "groomed",
   "abuse", "assault", "indicted", "sentenced", "pleaded", "trafficking",
   "exploitation", "kidnap", "luring", "sex", "molest", "convicted",
-  "investigation into", "missing girl", "missing boy", "victim",
+  "investigation", "missing girl", "missing boy", "victim", "danger",
+  "child safety", "children", "minors", "underage", "harm", "explicit",
+  // government and regulatory coverage
+  "senate", "congress", "lawmaker", "regulator", "regulation", "ftc",
+  "attorney general", "subpoena", "testify", "hearing", "ban roblox",
+  "age verification law", "coppa", "probe",
 ];
+
+// game coverage and SEO filler, as opposed to platform news. these are articles
+// ABOUT games that happen to run on roblox, which is not what this terminal is for.
+const GAME_COVERAGE = [
+  "codes", "code list", "free codes", "tier list", "how to get", "how to find",
+  "beginner guide", "walkthrough", "best weapons", "best units", "all bosses",
+  "speedrun", "tips and tricks", "everything you need to know about",
+  // other platforms
+  "fortnite", "minecraft", "call of duty", "gta ", "grand theft auto",
+  "among us", "valorant", "overwatch", "genshin",
+  // individual roblox games
+  "99 nights", "grow a garden", "steal a brainrot", "blox fruits", "adopt me",
+  "murder mystery", "brookhaven", "doors", "dress to impress", "blade ball",
+  "pet simulator", "jailbreak", "arsenal", "tower defense",
+];
+
+function gameCoverage(text) {
+  const t = String(text).toLowerCase();
+  return GAME_COVERAGE.some((w) => t.includes(w));
+}
 
 function outletAllowed(outlet) {
   const o = String(outlet).toLowerCase();
@@ -253,6 +272,7 @@ async function fetchGoogleNews(cfg) {
   let rejectedOutlet = 0;
   let rejectedTopic = 0;
   let rejectedOffTopic = 0;
+  let rejectedGame = 0;
 
   for (const item of rssItems(xml)) {
     const rawTitle = tagText(item, "title");
@@ -268,6 +288,7 @@ async function fetchGoogleNews(cfg) {
     if (!outletAllowed(outlet)) { rejectedOutlet++; continue; }
     if (topicBlocked(rawTitle)) { rejectedTopic++; continue; }
     if (!mentionsRoblox(rawTitle) && !mentionsRoblox(descr)) { rejectedOffTopic++; continue; }
+    if (gameCoverage(rawTitle)) { rejectedGame++; continue; }
 
     // google news formats titles as "Headline - Outlet"; drop the suffix since
     // the outlet is carried separately in the source field
@@ -290,7 +311,7 @@ async function fetchGoogleNews(cfg) {
 
   console.log(
     `google news "${cfg.query}": kept ${out.length}, ` +
-    `rejected ${rejectedOutlet} by outlet, ${rejectedTopic} by topic, ${rejectedOffTopic} off-topic`
+    `rejected ${rejectedOutlet} by outlet, ${rejectedTopic} by topic, ${rejectedOffTopic} off-topic, ${rejectedGame} game-coverage`
   );
   if (out.length === 0) throw new Error("no items survived filtering");
   return out;
