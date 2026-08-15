@@ -150,13 +150,31 @@ async function fetchDevforum(cfg) {
   const ids = await loadCategoryIds();
   const id = ids[cfg.slug];
 
-  const topics = data?.topic_list?.topics || [];
+  // discourse paginates at ~30 topics. the update categories carry the real
+  // feature news, so they pull several pages.
+  const topics = [];
+  const pages = cfg.pages || 1;
+  const path = id ? `${cfg.slug}/${id}` : cfg.slug;
+
+  for (let p = 0; p < pages; p++) {
+    let page;
+    try {
+      page = await getJSON(`https://devforum.roblox.com/c/${path}.json?page=${p}`);
+    } catch (e) {
+      if (p === 0) throw e; // first page failing is a real error
+      break;                // later pages just mean we ran out
+    }
+    const got = page?.topic_list?.topics || [];
+    if (got.length === 0) break;
+    topics.push(...got);
+  }
+
   if (topics.length === 0) {
     console.warn(`devforum: slug "${cfg.slug}" returned nothing; skipping.`);
     return [];
   }
 
-  return topics
+  const kept = topics
     .filter((t) => !t.pinned_globally && !topicBlocked(t.title))
     .map((t) => ({
       title: t.title,
@@ -168,6 +186,9 @@ async function fetchDevforum(cfg) {
       date: t.created_at,
       confirmed: cfg.confirmed,
     }));
+
+  console.log(`devforum ${cfg.slug}: ${topics.length} topics -> ${kept.length} kept`);
+  return kept;
 }
 
 // ---------------------------------------------------------------------------
