@@ -1,13 +1,13 @@
-// ROBLOX REPORT :: news backend  (v2)
+// ROBLOX REPORT :: news backend  (v3)
 // Aggregates FREE Roblox news into the article schema the experience expects
 // and serves it at GET /articles.
 //
-// Reddit is tried three ways, best first:
-//   1. OAuth      - reliable, needs two free env vars (see DEPLOY-GUIDE)
-//   2. plain JSON - works from home IPs, usually 403s from cloud hosts
-//   3. RSS        - the fallback that most often survives on cloud hosts
+// Sources: Roblox DevForum (Discourse json) + Google News RSS.
+// Both are free, need no API key, and work from cloud hosts.
 //
-// No key of any kind is required to run this. OAuth is optional.
+// Reddit was removed: its Responsible Builder Policy disabled self-serve app
+// creation, so OAuth is impossible to set up, and the anonymous endpoints
+// return 403 then 429 from cloud IPs.
 
 import http from "node:http";
 
@@ -15,10 +15,6 @@ const PORT = process.env.PORT || 3000;
 const REFRESH_MS = 10 * 60 * 1000;
 const MAX_ARTICLES = 80;
 
-const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID || "";
-const REDDIT_CLIENT_SECRET = process.env.REDDIT_CLIENT_SECRET || "";
-
-// Reddit rejects generic agents. Must be descriptive.
 const UA = "web:roblox-report:v2.0 (news terminal for a Roblox experience)";
 
 // ---------------------------------------------------------------------------
@@ -38,11 +34,12 @@ const DEVFORUM_CATEGORIES = [
   { slug: "bulletin-board",      source: "Roblox", category: "Community", confirmed: true },
 ];
 
-// Reddit is third-party chatter: source "RTC", confirmed false.
-// That is what lights up the TwitIcon filter and the Unconfirmed label.
-const SUBREDDITS = [
-  { name: "roblox",        category: "Community" },
-  { name: "robloxgamedev", category: "Studio" },
+// Third-party coverage. Anything whose source is not exactly "Roblox" shows the
+// twitter icon, reads "3rd Party Post", and is hidden by the TwitIcon toggle.
+const NEWS_QUERIES = [
+  { query: "Roblox",                  category: "Platform"  },
+  { query: "Roblox update OR event",  category: "Events"    },
+  { query: "Roblox Studio developer", category: "Studio"    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -80,17 +77,24 @@ async function getText(url, headers = {}) {
   return res.text();
 }
 
-function stripHtml(s) {
+function decodeEntities(s) {
   return String(s || "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
-    .replace(/&[a-z]+;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&"); // last, or it would re-create the others
+}
+
+// decode FIRST, then strip: google news descriptions are escaped html, so
+// stripping first would leave "&lt;a href=" visible in the ui
+function stripHtml(s) {
+  let out = decodeEntities(String(s || ""));
+  out = out.replace(/<[^>]*>/g, " ");
+  out = decodeEntities(out);
+  return out.replace(/&[a-z]+;/gi, " ").replace(/\s+/g, " ").trim();
 }
 
 function firstImage(html) {
@@ -164,121 +168,63 @@ async function fetchDevforum(cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// REDDIT  (three strategies, best first)
+// GOOGLE NEWS RSS  (free, no key, no app registration, no cloud-IP blocking)
+//
+// This replaced Reddit. Reddit's Responsible Builder Policy disabled self-serve
+// app creation, so OAuth cannot be set up at all, and both the plain JSON and
+// RSS endpoints refuse requests from cloud hosts (403 then 429).
+//
+// Google News aggregates real published articles about Roblox from actual
+// outlets, which is a better fit for "3rd Party Post" than forum chatter was.
 // ---------------------------------------------------------------------------
-let redditToken = { value: "", expiresAt: 0 };
-
-async function getRedditToken() {
-  if (!REDDIT_CLIENT_ID || !REDDIT_CLIENT_SECRET) return "";
-  if (redditToken.value && Date.now() < redditToken.expiresAt) return redditToken.value;
-
-  const basic = Buffer.from(`${REDDIT_CLIENT_ID}:${REDDIT_CLIENT_SECRET}`).toString("base64");
-  const res = await fetch("https://www.reddit.com/api/v1/access_token", {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": UA,
-    },
-    body: "grant_type=client_credentials",
-  });
-  if (!res.ok) throw new Error(`token HTTP ${res.status}`);
-  const json = await res.json();
-  redditToken = {
-    value: json.access_token,
-    // refresh a minute early so no request rides an expiring token
-    expiresAt: Date.now() + (json.expires_in - 60) * 1000,
-  };
-  console.log("reddit: obtained oauth token");
-  return redditToken.value;
+function rssItems(xml) {
+  return String(xml).split("<item>").slice(1);
 }
 
-function redditPostsToArticles(posts, cfg) {
-  return posts
-    .filter((p) => p && !p.stickied && !p.over_18)
-    .map((p) => ({
-      title: p.title,
-      description: stripHtml(p.selftext).slice(0, 300) || p.title,
-      url: `https://www.reddit.com${p.permalink}`,
-      image: "",
-      source: "RTC",
-      category: classify(p.title, cfg.category),
-      date: new Date(p.created_utc * 1000).toISOString(),
-      confirmed: false,
-    }));
+function tagText(chunk, tag) {
+  const m = chunk.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "i"));
+  if (!m) return "";
+  return stripHtml(m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1"));
 }
 
-// Reddit's Atom feed. Survives on cloud IPs more often than the json endpoints.
-function parseRedditRSS(xml, cfg) {
+async function fetchGoogleNews(cfg) {
+  const url =
+    "https://news.google.com/rss/search?q=" +
+    encodeURIComponent(cfg.query) +
+    "&hl=en-US&gl=US&ceid=US:en";
+
+  const xml = await getText(url);
   const out = [];
-  const entries = String(xml).split("<entry>").slice(1);
-  for (const e of entries) {
-    const title = stripHtml((e.match(/<title[^>]*>([\s\S]*?)<\/title>/) || [])[1]);
-    const link = (e.match(/<link[^>]+href=["']([^"']+)["']/) || [])[1];
-    const updated = (e.match(/<updated>([\s\S]*?)<\/updated>/) || [])[1];
-    const content = (e.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1] || "";
-    if (!title || !link) continue;
+
+  for (const item of rssItems(xml)) {
+    const rawTitle = tagText(item, "title");
+    const link = tagText(item, "link");
+    const pubDate = tagText(item, "pubDate");
+    const outlet = tagText(item, "source") || "News";
+    if (!rawTitle || !link) continue;
+
+    // google news formats titles as "Headline - Outlet"; drop the suffix since
+    // the outlet is carried separately in the source field
+    const escaped = outlet.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const title = rawTitle.replace(new RegExp(`\\s*-\\s*${escaped}\\s*$`), "").trim();
+
     out.push({
       title,
-      description: stripHtml(content).slice(0, 300) || title,
+      description: tagText(item, "description") || title,
       url: link,
       image: "",
-      source: "RTC",
+      // the real outlet name; the ui renders "- BY <outlet>" from this
+      source: outlet,
       category: classify(title, cfg.category),
-      date: updated || new Date().toISOString(),
-      confirmed: false,
+      date: pubDate ? new Date(pubDate).toISOString() : new Date().toISOString(),
+      // published articles from real outlets, so not "unconfirmed"
+      confirmed: true,
     });
   }
+
+  if (out.length === 0) throw new Error("no items in feed");
+  console.log(`google news "${cfg.query}": ${out.length} articles`);
   return out;
-}
-
-async function fetchSubreddit(cfg) {
-  const strategies = [
-    {
-      name: "oauth",
-      run: async () => {
-        const token = await getRedditToken();
-        if (!token) throw new Error("no oauth credentials configured");
-        const data = await getJSON(
-          `https://oauth.reddit.com/r/${cfg.name}/hot?limit=25`,
-          { Authorization: `Bearer ${token}` }
-        );
-        return redditPostsToArticles((data?.data?.children || []).map((c) => c.data), cfg);
-      },
-    },
-    {
-      name: "json",
-      run: async () => {
-        const data = await getJSON(`https://www.reddit.com/r/${cfg.name}/hot.json?limit=25`);
-        return redditPostsToArticles((data?.data?.children || []).map((c) => c.data), cfg);
-      },
-    },
-    {
-      name: "rss",
-      run: async () => {
-        const xml = await getText(`https://www.reddit.com/r/${cfg.name}/hot/.rss?limit=25`);
-        const parsed = parseRedditRSS(xml, cfg);
-        if (parsed.length === 0) throw new Error("rss returned no entries");
-        return parsed;
-      },
-    },
-  ];
-
-  let lastError;
-  for (const s of strategies) {
-    try {
-      const result = await s.run();
-      if (result.length > 0) {
-        console.log(`reddit r/${cfg.name}: ${result.length} posts via ${s.name}`);
-        return result;
-      }
-      lastError = new Error("empty result");
-    } catch (e) {
-      lastError = e;
-      console.warn(`reddit r/${cfg.name}: ${s.name} failed (${e.message})`);
-    }
-  }
-  throw lastError || new Error("all strategies failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +244,9 @@ function validate(a) {
     // only roblox-hosted assets can render, so anything else is dropped and the
     // experience falls back to its placeholder rather than showing a broken image
     image: typeof a.image === "string" && a.image.startsWith("rbxassetid://") ? a.image : "",
-    source: ["Roblox", "RTC", "Bloxy News"].includes(a.source) ? a.source : "RTC",
+    // "Roblox" is the official-source marker the ui checks; anything else is
+    // treated as third-party and keeps its real outlet name for "- BY <outlet>"
+    source: typeof a.source === "string" && a.source.trim() ? String(a.source).slice(0, 40) : "News",
     category: ["Studio", "Platform", "Community", "Events"].includes(a.category) ? a.category : "Community",
     date: new Date(when).toISOString(),
     confirmed: a.confirmed === true,
@@ -311,28 +259,28 @@ async function refresh() {
     run: () => fetchDevforum(c),
   }));
 
-  // reddit rate-limits hard (429) when several requests land together, so these
-  // run one at a time with a gap rather than in parallel
-  const redditJobs = SUBREDDITS.map((c) => ({
-    id: `reddit:${c.name}`,
-    run: () => fetchSubreddit(c),
+  // google news is happy with parallel requests, but a small gap keeps us
+  // comfortably polite
+  const newsJobs = NEWS_QUERIES.map((c) => ({
+    id: `news:${c.query}`,
+    run: () => fetchGoogleNews(c),
   }));
 
-  const jobs = [...devforumJobs, ...redditJobs];
+  const jobs = [...devforumJobs, ...newsJobs];
 
   const devforumResults = await Promise.allSettled(devforumJobs.map((j) => j.run()));
 
-  const redditResults = [];
-  for (const job of redditJobs) {
+  const newsResults = [];
+  for (const job of newsJobs) {
     try {
-      redditResults.push({ status: "fulfilled", value: await job.run() });
+      newsResults.push({ status: "fulfilled", value: await job.run() });
     } catch (e) {
-      redditResults.push({ status: "rejected", reason: e });
+      newsResults.push({ status: "rejected", reason: e });
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 500));
   }
 
-  const results = [...devforumResults, ...redditResults];
+  const results = [...devforumResults, ...newsResults];
 
   const all = [];
   let okCount = 0;
@@ -406,8 +354,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`roblox-report backend v2 listening on :${PORT}`);
-  console.log(`reddit oauth: ${REDDIT_CLIENT_ID ? "configured" : "NOT configured (will try json, then rss)"}`);
+  console.log(`roblox-report backend v3 listening on :${PORT}`);
   refresh().catch((e) => console.error("initial refresh failed:", e.message));
   setInterval(() => refresh().catch((e) => console.error("refresh failed:", e.message)), REFRESH_MS);
 });
