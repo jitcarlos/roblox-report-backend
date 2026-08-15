@@ -154,7 +154,7 @@ async function fetchDevforum(cfg) {
 
   const topics = data?.topic_list?.topics || [];
   return topics
-    .filter((t) => !t.pinned_globally)
+    .filter((t) => !t.pinned_globally && !topicBlocked(t.title))
     .map((t) => ({
       title: t.title,
       description: stripHtml(t.excerpt) || t.title,
@@ -165,6 +165,52 @@ async function fetchDevforum(cfg) {
       date: t.created_at,
       confirmed: cfg.confirmed,
     }));
+}
+
+// ---------------------------------------------------------------------------
+// RELEVANCE FILTER
+//
+// A plain "Roblox" news search returns lawsuits, stock analysis and local TV
+// crime coverage alongside actual gaming news. None of that belongs on a news
+// terminal inside a Roblox experience, so third-party articles must clear both
+// an outlet allowlist and a topic blocklist.
+// ---------------------------------------------------------------------------
+
+// gaming and tech press only. add outlets here as you see them in the logs.
+const ALLOWED_OUTLETS = [
+  "ign", "eurogamer", "rock paper shotgun", "polygon", "pc gamer", "kotaku",
+  "gamesindustry", "pocket gamer", "insider gaming", "gosugamers", "vgc",
+  "video games chronicle", "the verge", "engadget", "techcrunch", "tech times",
+  "dexerto", "destructoid", "game rant", "screen rant", "gamespot", "gamedeveloper",
+  "game developer", "digital trends", "androidcentral", "windows central",
+  "nintendo life", "push square", "gamesradar", "pcgamesn", "massively",
+  "80.lv", "hackernoon", "neowin", "ars technica", "wired", "the gamer", "thegamer",
+];
+
+// topics to reject regardless of outlet
+const BLOCKED_WORDS = [
+  // legal
+  "lawsuit", "lawsuits", "sues", "sued", "suing", "settlement", "court",
+  "attorney", "litigation", "subpoena", "class action", "plaintiff",
+  // finance
+  "stock", "shares", "nyse", "earnings", "price target", "analyst",
+  "investor", "market cap", "valuation", "quarterly results", "revenue beat",
+  "downgrade", "upgrade rating", "short interest", "hedge fund",
+  // crime and safety reporting, not appropriate for an in-experience terminal
+  "arrest", "arrested", "charged", "predator", "grooming", "groomed",
+  "abuse", "assault", "indicted", "sentenced", "pleaded", "trafficking",
+  "exploitation", "kidnap", "luring", "sex", "molest", "convicted",
+  "investigation into", "missing girl", "missing boy", "victim",
+];
+
+function outletAllowed(outlet) {
+  const o = String(outlet).toLowerCase();
+  return ALLOWED_OUTLETS.some((a) => o.includes(a));
+}
+
+function topicBlocked(text) {
+  const t = String(text).toLowerCase();
+  return BLOCKED_WORDS.some((w) => t.includes(w));
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +241,8 @@ async function fetchGoogleNews(cfg) {
 
   const xml = await getText(url);
   const out = [];
+  let rejectedOutlet = 0;
+  let rejectedTopic = 0;
 
   for (const item of rssItems(xml)) {
     const rawTitle = tagText(item, "title");
@@ -202,6 +250,10 @@ async function fetchGoogleNews(cfg) {
     const pubDate = tagText(item, "pubDate");
     const outlet = tagText(item, "source") || "News";
     if (!rawTitle || !link) continue;
+
+    // gaming/tech press only, and no legal, financial or crime coverage
+    if (!outletAllowed(outlet)) { rejectedOutlet++; continue; }
+    if (topicBlocked(rawTitle)) { rejectedTopic++; continue; }
 
     // google news formats titles as "Headline - Outlet"; drop the suffix since
     // the outlet is carried separately in the source field
@@ -222,8 +274,11 @@ async function fetchGoogleNews(cfg) {
     });
   }
 
-  if (out.length === 0) throw new Error("no items in feed");
-  console.log(`google news "${cfg.query}": ${out.length} articles`);
+  console.log(
+    `google news "${cfg.query}": kept ${out.length}, ` +
+    `rejected ${rejectedOutlet} by outlet, ${rejectedTopic} by topic`
+  );
+  if (out.length === 0) throw new Error("no items survived filtering");
   return out;
 }
 
