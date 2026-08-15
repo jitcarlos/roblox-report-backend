@@ -37,10 +37,19 @@ const DEVFORUM_CATEGORIES = [
 // Third-party coverage. Anything whose source is not exactly "Roblox" shows the
 // twitter icon, reads "3rd Party Post", and is hidden by the TwitIcon toggle.
 const NEWS_QUERIES = [
-  { query: "Roblox",                  category: "Platform"  },
-  { query: "Roblox update OR event",  category: "Events"    },
-  { query: "Roblox Studio developer", category: "Studio"    },
+  // quote the phrase so google news treats it as required, not optional.
+  // "Roblox update OR event" was being read as Roblox OR update OR event,
+  // which is why fortnite stories were appearing under Events.
+  { query: '"Roblox"',                   category: "Platform" },
+  { query: '"Roblox" event',             category: "Events"   },
+  { query: '"Roblox" Studio developer',  category: "Studio"   },
 ];
+
+// belt and braces: whatever the query does, the article itself must mention
+// roblox somewhere or it is not roblox news
+function mentionsRoblox(text) {
+  return String(text).toLowerCase().includes("roblox");
+}
 
 // ---------------------------------------------------------------------------
 // CATEGORISATION
@@ -243,6 +252,7 @@ async function fetchGoogleNews(cfg) {
   const out = [];
   let rejectedOutlet = 0;
   let rejectedTopic = 0;
+  let rejectedOffTopic = 0;
 
   for (const item of rssItems(xml)) {
     const rawTitle = tagText(item, "title");
@@ -251,9 +261,13 @@ async function fetchGoogleNews(cfg) {
     const outlet = tagText(item, "source") || "News";
     if (!rawTitle || !link) continue;
 
-    // gaming/tech press only, and no legal, financial or crime coverage
+    const descr = tagText(item, "description");
+
+    // gaming/tech press only, no legal/financial/crime coverage, and it must
+    // actually be about roblox
     if (!outletAllowed(outlet)) { rejectedOutlet++; continue; }
     if (topicBlocked(rawTitle)) { rejectedTopic++; continue; }
+    if (!mentionsRoblox(rawTitle) && !mentionsRoblox(descr)) { rejectedOffTopic++; continue; }
 
     // google news formats titles as "Headline - Outlet"; drop the suffix since
     // the outlet is carried separately in the source field
@@ -262,7 +276,7 @@ async function fetchGoogleNews(cfg) {
 
     out.push({
       title,
-      description: tagText(item, "description") || title,
+      description: descr || title,
       url: link,
       image: "",
       // the real outlet name; the ui renders "- BY <outlet>" from this
@@ -276,10 +290,37 @@ async function fetchGoogleNews(cfg) {
 
   console.log(
     `google news "${cfg.query}": kept ${out.length}, ` +
-    `rejected ${rejectedOutlet} by outlet, ${rejectedTopic} by topic`
+    `rejected ${rejectedOutlet} by outlet, ${rejectedTopic} by topic, ${rejectedOffTopic} off-topic`
   );
   if (out.length === 0) throw new Error("no items survived filtering");
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// THUMBNAILS
+// Hand-made, hand-uploaded images. No scraping and no automatic uploading, so
+// nothing unreviewed can ever reach the screen or the owner's inventory.
+// Order: source image, then category image, then generic.
+// ---------------------------------------------------------------------------
+const IMAGES = {
+  source: {
+    Roblox: "rbxassetid://98000033020431",   // Report_RobloxSource
+    press:  "rbxassetid://111190113171579",  // Report_GamingPress
+  },
+  category: {
+    Studio:    "rbxassetid://136131488938986",
+    Platform:  "rbxassetid://114239623911906",
+    Community: "rbxassetid://105559260052005",
+    Events:    "rbxassetid://110706013366870",
+  },
+  generic: "rbxassetid://117858905448304",
+};
+
+function pickImage(article) {
+  if (article.source === "Roblox") {
+    return IMAGES.category[article.category] || IMAGES.source.Roblox || IMAGES.generic;
+  }
+  return IMAGES.category[article.category] || IMAGES.source.press || IMAGES.generic;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,9 +337,8 @@ function validate(a) {
     title: String(a.title).slice(0, 200),
     description: String(a.description || a.title).slice(0, 500),
     url: a.url,
-    // only roblox-hosted assets can render, so anything else is dropped and the
-    // experience falls back to its placeholder rather than showing a broken image
-    image: typeof a.image === "string" && a.image.startsWith("rbxassetid://") ? a.image : "",
+    // set below, after source and category are known
+    image: "",
     // "Roblox" is the official-source marker the ui checks; anything else is
     // treated as third-party and keeps its real outlet name for "- BY <outlet>"
     source: typeof a.source === "string" && a.source.trim() ? String(a.source).slice(0, 40) : "News",
@@ -306,6 +346,11 @@ function validate(a) {
     date: new Date(when).toISOString(),
     confirmed: a.confirmed === true,
   };
+}
+
+function withImage(a) {
+  a.image = pickImage(a);
+  return a;
 }
 
 async function refresh() {
@@ -344,7 +389,7 @@ async function refresh() {
       okCount++;
       for (const raw of r.value) {
         const clean = validate(raw);
-        if (clean) all.push(clean);
+        if (clean) all.push(withImage(clean));
       }
     } else {
       console.warn(`source failed: ${jobs[i].id}: ${r.reason?.message}`);
