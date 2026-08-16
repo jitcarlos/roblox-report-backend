@@ -133,6 +133,49 @@ function firstImage(html) {
 }
 
 // ---------------------------------------------------------------------------
+// EXCERPT CLEANUP
+// Discourse excerpts and search blurbs are slices, not summaries, so they open
+// mid-word ("...on that's come to light: seems newer items"). This trims them
+// back to a sentence boundary so a card reads like a headline deck.
+// ---------------------------------------------------------------------------
+function cleanExcerpt(raw, fallback) {
+  let t = stripHtml(raw || "").trim();
+  if (!t) return String(fallback || "");
+
+  // drop leading ellipses and any dangling first fragment
+  t = t.replace(/^[\s.\u2026]+/, "");
+
+  // if it still opens mid-sentence, skip ahead to the next real sentence start
+  if (/^[a-z,;:)\]]/.test(t)) {
+    const nextStart = t.search(/[.!?]\s+[A-Z0-9"']/);
+    if (nextStart !== -1) {
+      const candidate = t.slice(nextStart + 1).trim();
+      if (candidate.length >= 60) t = candidate;
+    }
+  }
+
+  // end on a sentence boundary rather than mid-word
+  const lastStop = Math.max(t.lastIndexOf(". "), t.lastIndexOf("! "), t.lastIndexOf("? "));
+  if (lastStop > 80) t = t.slice(0, lastStop + 1);
+  else if (t.length > 60) t = t.replace(/\s+\S*$/, "") + "...";
+
+  t = t.trim();
+  if (!t) return String(fallback || "");
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+// A forum question is not a headline. "How to archive avatar items" is somebody
+// asking, not news, so these never get promoted to the featured slot.
+const QUESTION_OPENERS = /^(how|why|what|when|where|which|who|is|are|can|should|does|do|did|would|will|has|have|any|anyone|help|need)\b/i;
+
+function isHeadline(title) {
+  const t = String(title).trim();
+  if (t.endsWith("?")) return false;
+  if (QUESTION_OPENERS.test(t)) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // DEVFORUM  (Discourse, no key)
 // ---------------------------------------------------------------------------
 // cache the PROMISE, not the result: all devforum sources are fetched in
@@ -198,13 +241,14 @@ async function fetchDevforum(cfg) {
     .filter((t) => !t.pinned_globally && !topicBlocked(t.title))
     .map((t) => ({
       title: t.title,
-      description: stripHtml(t.excerpt) || t.title,
+      description: cleanExcerpt(t.excerpt, t.title),
       url: `https://devforum.roblox.com/t/${t.slug}/${t.id}`,
       image: "",
       source: cfg.source,
       category: classify(t.title, cfg.category),
       date: t.created_at,
       confirmed: cfg.confirmed,
+      headline: isHeadline(t.title),
     }));
 
   console.log(`devforum ${cfg.slug}: ${topics.length} topics -> ${kept.length} kept`);
@@ -341,7 +385,7 @@ async function fetchGoogleNews(cfg) {
 
     out.push({
       title,
-      description: descr || title,
+      description: cleanExcerpt(descr, title),
       url: link,
       image: "",
       // the real outlet name; the ui renders "- BY <outlet>" from this
@@ -350,6 +394,7 @@ async function fetchGoogleNews(cfg) {
       date: pubDate ? new Date(pubDate).toISOString() : new Date().toISOString(),
       // published articles from real outlets, so not "unconfirmed"
       confirmed: true,
+      headline: isHeadline(title),
     });
   }
 
@@ -412,6 +457,7 @@ function validate(a) {
     date: new Date(when).toISOString(),
     confirmed: a.confirmed === true,
     official: a.official !== false && a.source === "Roblox",
+    headline: a.headline !== false,
   };
 }
 
@@ -620,7 +666,7 @@ async function searchDevforum(query, fresh) {
         const url = `https://devforum.roblox.com/t/${t.slug}/${t.id}`;
         if (byUrl.has(url)) continue;
 
-        const description = (blurb[t.id] || t.title).slice(0, 500);
+        const description = cleanExcerpt(blurb[t.id], t.title).slice(0, 500);
         byUrl.set(url, {
           article: withImage({
             title: String(t.title).slice(0, 200),
@@ -635,6 +681,7 @@ async function searchDevforum(query, fresh) {
             // unconfirmed and the game filters their text before display.
             confirmed: pass.scoped === true,
             official: pass.scoped === true,
+            headline: isHeadline(t.title),
           }),
           score: relevanceScore(t.title, description, originalQuery) + pass.bonus,
         });
