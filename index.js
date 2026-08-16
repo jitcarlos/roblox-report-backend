@@ -247,6 +247,9 @@ const BLOCKED_WORDS = [
   "investigation", "missing girl", "missing boy", "victim", "danger",
   "child safety", "children", "minors", "underage", "harm", "explicit",
   // government and regulatory coverage
+  // quoted user speech: QA transcripts, AMAs and similar carry whatever the
+  // audience said, which is not editorial content
+  "[removed]", "q&a", "qa and", "ama", "transcript", "asked me anything",
   "senate", "congress", "lawmaker", "regulator", "regulation", "ftc",
   "attorney general", "subpoena", "testify", "hearing", "ban roblox",
   "age verification law", "coppa", "probe",
@@ -327,7 +330,7 @@ async function fetchGoogleNews(cfg) {
     // gaming/tech press only, no legal/financial/crime coverage, and it must
     // actually be about roblox
     if (!outletAllowed(outlet)) { rejectedOutlet++; continue; }
-    if (topicBlocked(rawTitle)) { rejectedTopic++; continue; }
+    if (topicBlocked(rawTitle) || topicBlocked(descr)) { rejectedTopic++; continue; }
     if (!mentionsRoblox(rawTitle) && !mentionsRoblox(descr)) { rejectedOffTopic++; continue; }
     if (gameCoverage(rawTitle)) { rejectedGame++; continue; }
 
@@ -610,7 +613,8 @@ async function searchDevforum(query, fresh) {
       }
 
       for (const t of topics) {
-        if (topicBlocked(t.title)) continue;
+        const excerpt = stripHtml(blurb[t.id] || "");
+        if (topicBlocked(t.title) || topicBlocked(excerpt)) continue;
         if (!pass.scoped && gameCoverage(t.title)) continue;
 
         const url = `https://devforum.roblox.com/t/${t.slug}/${t.id}`;
