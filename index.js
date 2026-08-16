@@ -764,6 +764,63 @@ async function fetchArticleBody(topicId) {
 }
 
 // ---------------------------------------------------------------------------
+// REPLIES
+// Replies are arbitrary user content, so they are kept entirely separate from
+// the article body and carry an `isStaff` flag. The game filters every
+// non-staff reply through TextService before anything reaches a screen.
+// ---------------------------------------------------------------------------
+const repliesCache = new Map();
+const REPLIES_TTL_MS = 15 * 60 * 1000;
+const MAX_REPLIES = 25;
+const REPLY_MAX_CHARS = 400;
+
+// discourse trust levels: staff are flagged directly on the post
+function isStaffPost(p) {
+  return p.admin === true || p.moderator === true || p.staff === true;
+}
+
+async function fetchReplies(topicId) {
+  const id = String(topicId).replace(/\D/g, "");
+  if (!id) throw new Error("bad topic id");
+
+  const hit = repliesCache.get(id);
+  if (hit && Date.now() - hit.at < REPLIES_TTL_MS) return hit.payload;
+
+  const data = await getJSON(`https://devforum.roblox.com/t/${id}.json`);
+  const posts = data?.post_stream?.posts || [];
+  if (posts.length === 0) throw new Error("no posts");
+
+  const out = [];
+  for (const p of posts) {
+    // post 1 is the article itself and is shown on the other screen
+    if (p.post_number === 1) continue;
+    if (out.length >= MAX_REPLIES) break;
+
+    let text = stripHtml(p.cooked || "");
+    if (!text) continue;
+    if (topicBlocked(text)) continue;
+    if (text.length > REPLY_MAX_CHARS) {
+      text = text.slice(0, REPLY_MAX_CHARS).replace(/\s+\S*$/, "") + "...";
+    }
+
+    out.push({
+      text,
+      author: String(p.username || ""),
+      date: p.created_at ? new Date(p.created_at).toISOString() : "",
+      isStaff: isStaffPost(p),
+    });
+  }
+
+  const payload = {
+    title: String(data?.title || ""),
+    replies: out,
+  };
+  repliesCache.set(id, { at: Date.now(), payload });
+  console.log(`replies ${id}: ${out.length} kept of ${posts.length - 1}`);
+  return payload;
+}
+
+// ---------------------------------------------------------------------------
 // SERVER
 // ---------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
@@ -809,6 +866,19 @@ const server = http.createServer((req, res) => {
       .catch((e) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ id, text: "", author: "", error: e.message }));
+      });
+    return;
+  }
+  if (req.url.startsWith("/replies")) {
+    const id = new URL(req.url, "http://x").searchParams.get("id") || "";
+    fetchReplies(id)
+      .then((payload) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id, ...payload }));
+      })
+      .catch((e) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id, title: "", replies: [], error: e.message }));
       });
     return;
   }
