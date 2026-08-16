@@ -656,6 +656,44 @@ async function searchDevforum(query, fresh) {
 }
 
 // ---------------------------------------------------------------------------
+// ARTICLE BODY
+// The feed only carries a ~300 character excerpt, so there was never anything
+// to page through. This fetches the opening post of a DevForum topic on demand.
+// Only devforum topic ids are accepted, so it cannot be pointed at the wider
+// internet, and the same content rules apply as everywhere else.
+// ---------------------------------------------------------------------------
+const bodyCache = new Map();
+const BODY_TTL_MS = 60 * 60 * 1000;
+const BODY_MAX_CHARS = 6000;
+
+async function fetchArticleBody(topicId) {
+  const id = String(topicId).replace(/\D/g, "");
+  if (!id) throw new Error("bad topic id");
+
+  const hit = bodyCache.get(id);
+  if (hit && Date.now() - hit.at < BODY_TTL_MS) return hit.body;
+
+  const data = await getJSON(`https://devforum.roblox.com/t/${id}.json`);
+  const first = data?.post_stream?.posts?.[0];
+  if (!first) throw new Error("no opening post");
+
+  // the opening post only. replies are arbitrary user content and are never read.
+  let text = stripHtml(first.cooked || "");
+
+  if (topicBlocked(text) || topicBlocked(data?.title || "")) {
+    throw new Error("blocked content");
+  }
+
+  if (text.length > BODY_MAX_CHARS) {
+    text = text.slice(0, BODY_MAX_CHARS).replace(/\s+\S*$/, "") + "...";
+  }
+
+  bodyCache.set(id, { at: Date.now(), body: text });
+  console.log(`article body ${id}: ${text.length} chars`);
+  return text;
+}
+
+// ---------------------------------------------------------------------------
 // SERVER
 // ---------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
@@ -688,6 +726,19 @@ const server = http.createServer((req, res) => {
         console.warn(`search failed: ${e.message}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ articles: [], query: q, error: e.message }));
+      });
+    return;
+  }
+  if (req.url.startsWith("/article")) {
+    const id = new URL(req.url, "http://x").searchParams.get("id") || "";
+    fetchArticleBody(id)
+      .then((text) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id, text }));
+      })
+      .catch((e) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id, text: "", error: e.message }));
       });
     return;
   }
