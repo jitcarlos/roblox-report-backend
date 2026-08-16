@@ -18,6 +18,21 @@ const MAX_ARTICLES = 300;
 const UA = "web:roblox-report:v2.0 (news terminal for a Roblox experience)";
 
 // ---------------------------------------------------------------------------
+// SOURCE KILL SWITCHES
+// Flip any of these to false and that source stops contributing immediately on
+// the next refresh. No code changes, no redeploy needed beyond this file.
+// ---------------------------------------------------------------------------
+const SOURCES = {
+  DevForumUpdates: true,   // official Roblox staff announcements and release notes
+  GamingPress: true,       // allowlisted gaming/tech outlets via google news
+  DeepSearchOfficial: true,// search inside the official Updates category
+  // OFF by default. When true, search also covers the WHOLE devforum, which
+  // means arbitrary user-written topic titles reach the screen. That is the
+  // only place third-party user content can enter this system.
+  DeepSearchWholeForum: false,
+};
+
+// ---------------------------------------------------------------------------
 // SOURCES
 //
 // DevForum categories are looked up BY SLUG at startup, so no fragile numeric
@@ -393,6 +408,7 @@ function validate(a) {
     category: ["Studio", "Platform", "Community", "Events"].includes(a.category) ? a.category : "Community",
     date: new Date(when).toISOString(),
     confirmed: a.confirmed === true,
+    official: a.official !== false && a.source === "Roblox",
   };
 }
 
@@ -402,17 +418,15 @@ function withImage(a) {
 }
 
 async function refresh() {
-  const devforumJobs = DEVFORUM_CATEGORIES.map((c) => ({
-    id: `devforum:${c.slug}`,
-    run: () => fetchDevforum(c),
-  }));
+  const devforumJobs = SOURCES.DevForumUpdates
+    ? DEVFORUM_CATEGORIES.map((c) => ({ id: `devforum:${c.slug}`, run: () => fetchDevforum(c) }))
+    : [];
 
   // google news is happy with parallel requests, but a small gap keeps us
   // comfortably polite
-  const newsJobs = NEWS_QUERIES.map((c) => ({
-    id: `news:${c.query}`,
-    run: () => fetchGoogleNews(c),
-  }));
+  const newsJobs = SOURCES.GamingPress
+    ? NEWS_QUERIES.map((c) => ({ id: `news:${c.query}`, run: () => fetchGoogleNews(c) }))
+    : [];
 
   const jobs = [...devforumJobs, ...newsJobs];
 
@@ -564,10 +578,14 @@ async function searchDevforum(query, fresh) {
   // always outrank general forum threads on the same topic.
   const passes = [];
   for (const v of variants) {
-    passes.push({ ...v, scoped: true, bonus: v.bonus + 15000 });
+    if (SOURCES.DeepSearchOfficial) {
+      passes.push({ ...v, scoped: true, bonus: v.bonus + 15000 });
+    }
     // single keywords are only searched inside Updates; unscoped single-word
     // searches drag in unrelated forum threads
-    if (!v.keyword) passes.push({ ...v, scoped: false });
+    if (!v.keyword && SOURCES.DeepSearchWholeForum) {
+      passes.push({ ...v, scoped: false });
+    }
   }
 
   for (const pass of passes) {
@@ -608,7 +626,11 @@ async function searchDevforum(query, fresh) {
             source: "Roblox",
             category: classify(t.title, "Platform"),
             date: new Date(t.created_at).toISOString(),
-            confirmed: true,
+            // scoped results are staff posts in the official Updates category.
+            // unscoped results are arbitrary forum topics, so they are marked
+            // unconfirmed and the game filters their text before display.
+            confirmed: pass.scoped === true,
+            official: pass.scoped === true,
           }),
           score: relevanceScore(t.title, description, originalQuery) + pass.bonus,
         });
@@ -689,6 +711,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`roblox-report backend v3 listening on :${PORT}`);
+  console.log("sources: " + Object.entries(SOURCES).map(([k, v]) => `${k}=${v}`).join(", "));
   refresh().catch((e) => console.error("initial refresh failed:", e.message));
   setInterval(() => refresh().catch((e) => console.error("refresh failed:", e.message)), REFRESH_MS);
 });
