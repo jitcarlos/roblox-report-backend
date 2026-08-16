@@ -374,6 +374,7 @@ function pickImage(article) {
 // AGGREGATION
 // ---------------------------------------------------------------------------
 let cache = { articles: [], updatedAt: null, live: false };
+let lastForcedRefresh = 0;
 
 function validate(a) {
   if (!a || typeof a.title !== "string" || !a.title.trim()) return null;
@@ -521,13 +522,15 @@ async function searchDevforumPage(q, page, scoped) {
   return getJSON(url);
 }
 
-async function searchDevforum(query) {
+async function searchDevforum(query, fresh) {
   const q = String(query).trim().slice(0, 80);
   if (!q) return [];
 
   const key = q.toLowerCase();
-  const hit = searchCache.get(key);
-  if (hit && Date.now() - hit.at < SEARCH_TTL_MS) return hit.articles;
+  if (!fresh) {
+    const hit = searchCache.get(key);
+    if (hit && Date.now() - hit.at < SEARCH_TTL_MS) return hit.articles;
+  }
 
   const started = Date.now();
   const byUrl = new Map();
@@ -603,13 +606,26 @@ async function searchDevforum(query) {
 // ---------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
   if (req.url.startsWith("/articles")) {
-    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "public, max-age=60" });
-    res.end(JSON.stringify(cache));
+    const force = new URL(req.url, "http://x").searchParams.get("refresh") === "1";
+    const send = () => {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "public, max-age=60" });
+      res.end(JSON.stringify(cache));
+    };
+    // a forced refresh re-pulls every source, but no more than once a minute so
+    // a button mash cannot hammer the devforum
+    if (force && Date.now() - lastForcedRefresh > 60 * 1000) {
+      lastForcedRefresh = Date.now();
+      refresh().then(send).catch(send);
+    } else {
+      send();
+    }
     return;
   }
   if (req.url.startsWith("/search")) {
-    const q = new URL(req.url, "http://x").searchParams.get("q") || "";
-    searchDevforum(q)
+    const params = new URL(req.url, "http://x").searchParams;
+    const q = params.get("q") || "";
+    const fresh = params.get("fresh") === "1";
+    searchDevforum(q, fresh)
       .then((articles) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ articles, query: q }));
