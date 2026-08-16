@@ -529,6 +529,7 @@ async function searchDevforum(query) {
   const hit = searchCache.get(key);
   if (hit && Date.now() - hit.at < SEARCH_TTL_MS) return hit.articles;
 
+  const started = Date.now();
   const byUrl = new Map();
 
   // two passes. official Updates first, then the wider forum, so official
@@ -539,17 +540,20 @@ async function searchDevforum(query) {
   ];
 
   for (const pass of passes) {
-    for (let page = 1; page <= pass.pages; page++) {
-      let data;
-      try {
-        data = await searchDevforumPage(q, page, pass.scoped);
-      } catch (e) {
-        break; // ran out of pages, or discourse refused; keep what we have
-      }
+    // all pages of a pass at once. sequential paging was the whole reason a
+    // deep search took so long: 16 round trips one after another.
+    const pageNumbers = Array.from({ length: pass.pages }, (_, i) => i + 1);
+    const settled = await Promise.allSettled(
+      pageNumbers.map((page) => searchDevforumPage(q, page, pass.scoped))
+    );
+
+    for (const result of settled) {
+      if (result.status !== "fulfilled") continue;
+      const data = result.value;
 
       const topics = data?.topics || [];
       const posts = data?.posts || [];
-      if (topics.length === 0) break;
+      if (topics.length === 0) continue;
 
       const blurb = {};
       for (const p of posts) {
@@ -590,7 +594,7 @@ async function searchDevforum(query) {
     .slice(0, SEARCH_MAX_RESULTS);
 
   searchCache.set(key, { at: Date.now(), articles: ranked });
-  console.log(`search "${q}": ${ranked.length} results (from ${byUrl.size} unique topics)`);
+  console.log(`search "${q}": ${ranked.length} results (from ${byUrl.size} unique topics) in ${Date.now() - started}ms`);
   return ranked;
 }
 
