@@ -207,6 +207,17 @@ function loadCategoryIds() {
   return categoryIdPromise;
 }
 
+// discourse gives posters as user ids that index into a separate users array
+function originalPoster(topic, users) {
+  if (!topic || !Array.isArray(users)) return "";
+  const entry = (topic.posters || []).find(
+    (p) => typeof p.description === "string" && p.description.includes("Original Poster")
+  ) || (topic.posters || [])[0];
+  if (!entry) return "";
+  const user = users.find((u) => u.id === entry.user_id);
+  return user ? String(user.username || "") : "";
+}
+
 async function fetchDevforum(cfg) {
   const ids = await loadCategoryIds();
   const id = ids[cfg.slug];
@@ -229,6 +240,8 @@ async function fetchDevforum(cfg) {
     }
     const got = page?.topic_list?.topics || [];
     if (got.length === 0) break;
+    const users = page?.users || [];
+    for (const t of got) t.__author = originalPoster(t, users);
     topics.push(...got);
   }
 
@@ -249,6 +262,7 @@ async function fetchDevforum(cfg) {
       date: t.created_at,
       confirmed: cfg.confirmed,
       headline: isHeadline(t.title),
+      author: t.__author || "",
     }));
 
   console.log(`devforum ${cfg.slug}: ${topics.length} topics -> ${kept.length} kept`);
@@ -458,6 +472,8 @@ function validate(a) {
     confirmed: a.confirmed === true,
     official: a.official !== false && a.source === "Roblox",
     headline: a.headline !== false,
+    // devforum username of the original poster, "" when unknown
+    author: typeof a.author === "string" ? a.author.slice(0, 32) : "",
   };
 }
 
@@ -653,9 +669,14 @@ async function searchDevforum(query, fresh) {
       const posts = data?.posts || [];
       if (topics.length === 0) continue;
 
+      // only the OPENING post (post_number 1) may supply a description.
+      // search matches are usually replies, and quoting those put community
+      // arguments on the card instead of the staff announcement.
       const blurb = {};
       for (const p of posts) {
-        if (p.topic_id && !blurb[p.topic_id]) blurb[p.topic_id] = stripHtml(p.blurb);
+        if (p.topic_id && p.post_number === 1 && !blurb[p.topic_id]) {
+          blurb[p.topic_id] = stripHtml(p.blurb);
+        }
       }
 
       for (const t of topics) {
@@ -682,6 +703,7 @@ async function searchDevforum(query, fresh) {
             confirmed: pass.scoped === true,
             official: pass.scoped === true,
             headline: isHeadline(t.title),
+            author: "",
           }),
           score: relevanceScore(t.title, description, originalQuery) + pass.bonus,
         });
@@ -735,9 +757,10 @@ async function fetchArticleBody(topicId) {
     text = text.slice(0, BODY_MAX_CHARS).replace(/\s+\S*$/, "") + "...";
   }
 
-  bodyCache.set(id, { at: Date.now(), body: text });
-  console.log(`article body ${id}: ${text.length} chars`);
-  return text;
+  const payload = { text, author: String(first.username || "") };
+  bodyCache.set(id, { at: Date.now(), body: payload });
+  console.log(`article body ${id}: ${text.length} chars by ${payload.author || "unknown"}`);
+  return payload;
 }
 
 // ---------------------------------------------------------------------------
@@ -779,13 +802,13 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith("/article")) {
     const id = new URL(req.url, "http://x").searchParams.get("id") || "";
     fetchArticleBody(id)
-      .then((text) => {
+      .then((payload) => {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ id, text }));
+        res.end(JSON.stringify({ id, text: payload.text, author: payload.author }));
       })
       .catch((e) => {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ id, text: "", error: e.message }));
+        res.end(JSON.stringify({ id, text: "", author: "", error: e.message }));
       });
     return;
   }
