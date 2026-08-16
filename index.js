@@ -480,7 +480,8 @@ async function refresh() {
 // ---------------------------------------------------------------------------
 const searchCache = new Map(); // query -> { at, articles }
 const SEARCH_TTL_MS = 5 * 60 * 1000;
-const SEARCH_PAGES = 8;          // discourse returns ~50 topics per page
+const SEARCH_PAGES = 6;          // discourse returns ~50 topics per page
+const KEYWORD_PAGES = 3;         // per individual keyword; keeps request count sane
 const SEARCH_MAX_RESULTS = 400;  // plenty; the ui renders the top slice
 
 function relevanceScore(title, description, query) {
@@ -515,6 +516,7 @@ function relevanceScore(title, description, query) {
 
 async function searchDevforumPage(q, page, scoped) {
   const term = scoped ? `${q} #updates` : q;
+  // q here is already the variant term, not the raw query
   const url =
     "https://devforum.roblox.com/search.json?q=" +
     encodeURIComponent(term) +
@@ -533,21 +535,47 @@ async function searchDevforum(query, fresh) {
   }
 
   const started = Date.now();
+  const originalQuery = q;
   const byUrl = new Map();
 
-  // two passes. official Updates first, then the wider forum, so official
-  // announcements always outrank general forum threads on the same topic.
-  const passes = [
-    { scoped: true,  pages: SEARCH_PAGES, bonus: 15000 },
-    { scoped: false, pages: SEARCH_PAGES, bonus: 0 },
-  ];
+  // KEYWORD EXPANSION
+  // Discourse ANDs every term, so "Sakura Antlers" only matches topics
+  // containing both words and returns a handful of results. Searching the exact
+  // phrase, the full term, and each keyword separately turns that into hundreds
+  // of hits, while relevanceScore still floats the specific topic to the top.
+  const words = q
+    .split(/\s+/)
+    .map((w) => w.replace(/[^\w'-]/g, ""))
+    .filter((w) => w.length > 2);
+
+  const variants = [];
+  // exact phrase, worth the most
+  if (words.length > 1) variants.push({ term: `"${q}"`, pages: SEARCH_PAGES, bonus: 40000 });
+  // all words, discourse's default AND
+  variants.push({ term: q, pages: SEARCH_PAGES, bonus: 20000 });
+  // each keyword on its own, which is where the volume comes from
+  for (const w of words.slice(0, 4)) {
+    if (w.toLowerCase() !== q.toLowerCase()) {
+      variants.push({ term: w, pages: KEYWORD_PAGES, bonus: 0, keyword: true });
+    }
+  }
+
+  // official Updates first, then the wider forum, so official announcements
+  // always outrank general forum threads on the same topic.
+  const passes = [];
+  for (const v of variants) {
+    passes.push({ ...v, scoped: true, bonus: v.bonus + 15000 });
+    // single keywords are only searched inside Updates; unscoped single-word
+    // searches drag in unrelated forum threads
+    if (!v.keyword) passes.push({ ...v, scoped: false });
+  }
 
   for (const pass of passes) {
     // all pages of a pass at once. sequential paging was the whole reason a
     // deep search took so long: 16 round trips one after another.
     const pageNumbers = Array.from({ length: pass.pages }, (_, i) => i + 1);
     const settled = await Promise.allSettled(
-      pageNumbers.map((page) => searchDevforumPage(q, page, pass.scoped))
+      pageNumbers.map((page) => searchDevforumPage(pass.term, page, pass.scoped))
     );
 
     for (const result of settled) {
@@ -582,7 +610,7 @@ async function searchDevforum(query, fresh) {
             date: new Date(t.created_at).toISOString(),
             confirmed: true,
           }),
-          score: relevanceScore(t.title, description, q) + pass.bonus,
+          score: relevanceScore(t.title, description, originalQuery) + pass.bonus,
         });
       }
     }
@@ -597,7 +625,7 @@ async function searchDevforum(query, fresh) {
     .slice(0, SEARCH_MAX_RESULTS);
 
   searchCache.set(key, { at: Date.now(), articles: ranked });
-  console.log(`search "${q}": ${ranked.length} results (from ${byUrl.size} unique topics) in ${Date.now() - started}ms`);
+  console.log(`search "${q}": ${ranked.length} results (from ${byUrl.size} unique topics, ${passes.length} queries) in ${Date.now() - started}ms`);
   return ranked;
 }
 
